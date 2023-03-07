@@ -10,7 +10,6 @@ from .utils import get_module_by_name
 _logger = logging.getLogger('FixMaskConflict')
 
 
-# TODO: mask conflict need refactor, the current implementation is very unfriendly to the input channel masks.
 def fix_mask_conflict(masks, model, dummy_input, traced=None):
     """
     MaskConflict fix the mask conflict for the channel dependencies
@@ -128,7 +127,7 @@ class GroupMaskConflict(MaskFix):
         for layername in depens:
             group_max = depens[layername]
             group_min = min_groups[layername]
-            if layername not in self.masks or 'weight' not in self.masks[layername]:
+            if layername not in self.masks:
                 # this layer not pruned
                 continue
             w_mask = self.masks[layername]['weight']
@@ -223,7 +222,7 @@ class ChannelMaskConflict(MaskFix):
         sum_idx = (1, 2, 3) if self.conv_prune_dim == 0 else (0, 2, 3)
 
         (_tmp_name, _tmp_tensor) = list(self.masks.items())[0]
-        device = list(_tmp_tensor.values())[0].device
+        device = _tmp_tensor['weight'].device
 
         for dset in depen_sets:
             if len(dset) <= 1:
@@ -234,14 +233,12 @@ class ChannelMaskConflict(MaskFix):
             channel_masks = []
             fine_grained = False
             for name in dset:
-                if name in self.masks and 'weight' in self.masks[name]:
+                if name in self.masks:
                     _, m = get_module_by_name(self.model, name)
                     assert m is not None
                     mask = self.masks[name]['weight']
                     if type(m).__name__ == 'Conv2d':
                         channel_mask = (mask.abs().sum(sum_idx) != 0).int()
-                        if self.conv_prune_dim == 1:
-                            channel_mask = channel_mask.repeat(m.groups)
                         channel_masks.append(channel_mask)
                         if (channel_mask.sum() * (mask.numel() / mask.shape[self.conv_prune_dim])).item() != (mask > 0).sum().item():
                             fine_grained = True
@@ -252,10 +249,6 @@ class ChannelMaskConflict(MaskFix):
                         else:
                             channel_masks.append(
                                 (mask.abs().sum(1) != 0).int())
-                    elif type(m).__name__ == 'Embedding':
-                        if self.conv_prune_dim == 0:
-                            channel_masks.append(
-                                (mask.abs().sum(0) != 0).int())
                     elif type(m).__name__ == 'BatchNorm2d':
                         channel_masks.append(mask.int())
                     elif type(m).__name__ == 'ConvTranspose2d':
@@ -264,8 +257,6 @@ class ChannelMaskConflict(MaskFix):
                         tmp_sum_idx = (
                             0, 2, 3) if self.conv_prune_dim == 0 else (1, 2, 3)
                         channel_mask = (mask.abs().sum(tmp_sum_idx) != 0).int()
-                        if self.conv_prune_dim == 0:
-                            channel_mask = channel_mask.repeat(m.groups)
                         channel_masks.append(channel_mask)
                         if (channel_mask.sum() * (mask.numel() / mask.shape[1 - self.conv_prune_dim])).item() != (mask > 0).sum().item():
                             fine_grained = True
@@ -299,7 +290,7 @@ class ChannelMaskConflict(MaskFix):
             merged_index = torch.nonzero(merged_channel_mask, as_tuple=True)[0]
 
             for name in dset:
-                if name not in self.masks or 'weight' not in self.masks[name]:
+                if name not in self.masks:
                     assert all(merged_channel_mask)
                     continue
                 orig_mask = self.masks[name]['weight']
@@ -309,14 +300,11 @@ class ChannelMaskConflict(MaskFix):
                     if self.conv_prune_dim == 0:
                         new_mask[merged_index, :, :, :] = 1.
                     else:
-                        new_mask[:, torch.nonzero(merged_channel_mask[:new_mask.shape[1]], as_tuple=True)[0], :, :] = 1.
+                        new_mask[:, merged_index, :, :] = 1.
                 elif type(m).__name__ == 'Linear':
                     if self.conv_prune_dim == 0:
-                        new_mask[merged_index, :] = 1.
+                        new_mask[merged_index, :] = 1
                     elif self.conv_prune_dim == 1:
-                        new_mask[:, merged_index] = 1.
-                elif type(m).__name__ == 'Embedding':
-                    if self.conv_prune_dim == 0:
                         new_mask[:, merged_index] = 1.
                 elif type(m).__name__ == 'BatchNorm2d':
                     new_mask = merged_channel_mask.type_as(orig_mask)
@@ -325,6 +313,8 @@ class ChannelMaskConflict(MaskFix):
                         f'unsupported module type: {type(m).__name__}')
                 self.masks[name]['weight'] = new_mask
                 if 'bias' in self.masks[name] and self.masks[name]['bias'] is not None:
+                    if type(m).__name__ == 'Conv2d':
+                        assert self.conv_prune_dim == 0
                     if self.conv_prune_dim == 0:
                         self.masks[name]['bias'] = merged_channel_mask.type_as(
                             self.masks[name]['bias'])
@@ -387,9 +377,6 @@ def detect_mask_prune_dim(masks, model):
     dim0_preserved, dim1_preserved = 0., 0.
     dim0_num, dim1_num = 0., 0.
     for module_name in masks:
-        if 'weight' not in masks[module_name]:
-            continue
-
         _, m = get_module_by_name(model, module_name)
         if m is None or type(m).__name__ != 'Conv2d':
             continue

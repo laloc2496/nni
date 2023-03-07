@@ -1,6 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# pylint: disable=wildcard-import,unused-wildcard-import
-
-from nni.compression.pytorch.pruning import *
+from .basic_pruner import *
+from .basic_scheduler import PruningScheduler
+from .iterative_pruner import *
+from .movement_pruner import MovementPruner
+from .auto_compress_pruner import AutoCompressPruner
+from .amc_pruner import AMCPruner

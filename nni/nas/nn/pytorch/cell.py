@@ -2,9 +2,8 @@
 # Licensed under the MIT license.
 
 import copy
-import logging
 import warnings
-from typing import Callable, Dict, List, Union, Optional, Tuple, Sequence, Union, cast
+from typing import Callable, Dict, List, Union, Optional, Tuple, Sequence, cast
 try:
     from typing import Literal
 except ImportError:
@@ -13,13 +12,9 @@ except ImportError:
 import torch
 import torch.nn as nn
 
-from nni.mutable import Sample, label_scope
-from nni.nas.space import model_context
-
 from .choice import ChosenInputs, LayerChoice, InputChoice
-from .base import MutableModule
-
-_logger = logging.getLogger(__name__)
+from .layers import ModuleList  # pylint: disable=no-name-in-module
+from .mutation_utils import generate_new_label
 
 
 class _ListIdentity(nn.Identity):
@@ -80,8 +75,7 @@ def preprocess_cell_inputs(num_predecessors: int, *inputs: Union[List[torch.Tens
     assert len(processed_inputs) == num_predecessors, 'The number of inputs must be equal to `num_predecessors`.'
     return processed_inputs
 
-
-class Cell(MutableModule):
+class Cell(nn.Module):
     """
     Cell structure that is popularly used in NAS literature.
 
@@ -267,15 +261,14 @@ class Cell(MutableModule):
                  *,
                  label: Optional[str] = None):
         super().__init__()
-
-        self.label_scope = label_scope(label)
+        self._label = generate_new_label(label)
 
         # modules are created in "natural" order
         # first create preprocessor
         self.preprocessor = preprocessor or _ListIdentity()
         # then create intermediate ops
-        self.ops = nn.ModuleList()
-        self.inputs = nn.ModuleList()
+        self.ops = ModuleList()
+        self.inputs = ModuleList()
         # finally postprocessor
         self.postprocessor = postprocessor or _DefaultPostprocessor()
 
@@ -291,15 +284,14 @@ class Cell(MutableModule):
         self.op_candidates_factory: Union[List[CellOpFactory], Dict[str, CellOpFactory], None] = None  # set later
 
         # fill-in the missing modules
-        with self.label_scope:
-            self._create_modules(op_candidates)
+        self._create_modules(op_candidates)
 
     def _create_modules(self, op_candidates):
         for i in range(self.num_predecessors, self.num_nodes + self.num_predecessors):
-            self.ops.append(nn.ModuleList())
-            self.inputs.append(nn.ModuleList())
+            self.ops.append(ModuleList())
+            self.inputs.append(ModuleList())
             for k in range(self.num_ops_per_node):
-                inp = InputChoice(i, 1, label=f'input_{i}_{k}')
+                inp = InputChoice(i, 1, label=f'{self.label}/input_{i}_{k}')
                 chosen = None
 
                 if isinstance(inp, ChosenInputs):
@@ -317,46 +309,12 @@ class Cell(MutableModule):
                     self.op_candidates_factory = op_candidates
 
                 # though it's layer choice and input choice here, in fixed mode, the chosen module will be created.
-                cast(nn.ModuleList, self.ops[-1]).append(LayerChoice(ops, label=f'op_{i}_{k}'))
-                cast(nn.ModuleList, self.inputs[-1]).append(inp)
-
-    def freeze(self, sample: Sample) -> 'Cell':
-        if self.op_candidates_factory is not None:
-            # Re-instantiate the whole cell if factory is used to create the operators.
-            # The operators might be different when the inputs get fixed.
-
-            _logger.debug('Recreating the cell `%s` to freeze as op factory is used.', self.label)
-            with model_context(sample):
-                return Cell(
-                    self.op_candidates_factory,
-                    self.num_nodes,
-                    self.num_ops_per_node,
-                    self.num_predecessors,
-                    self.merge_op,
-                    self.preprocessor,
-                    self.postprocessor,
-                    self.concat_dim,
-                    label=self.label,
-                )
-
-        else:
-            new_cell: Cell = super().freeze(sample)
-
-            # Only need to re-calculate the loose end indices
-            if new_cell.merge_op == 'loose_end':
-                used_nodes = set()
-                for input_list in new_cell.inputs:
-                    for input in input_list:
-                        assert isinstance(input, ChosenInputs)
-                        used_nodes.update(input.chosen)
-
-                new_cell.output_node_indices = [n for n in new_cell.output_node_indices if n not in used_nodes]
-
-            return new_cell
+                cast(ModuleList, self.ops[-1]).append(LayerChoice(ops, label=f'{self.label}/op_{i}_{k}'))
+                cast(ModuleList, self.inputs[-1]).append(inp)
 
     @property
     def label(self):
-        return self.label_scope.name
+        return self._label
 
     def forward(self, *inputs: Union[List[torch.Tensor], torch.Tensor]) -> Union[Tuple[torch.Tensor, ...], torch.Tensor]:
         """Forward propagation of cell.
@@ -385,5 +343,9 @@ class Cell(MutableModule):
                 current_state.append(op(inp(states)))
             current_state = torch.sum(torch.stack(current_state), 0)
             states.append(current_state)
-        this_cell = torch.cat([states[k] for k in self.output_node_indices], self.concat_dim)
+        if self.merge_op == 'all':
+            # a special case for graph engine
+            this_cell = torch.cat(states[self.num_predecessors:], self.concat_dim)
+        else:
+            this_cell = torch.cat([states[k] for k in self.output_node_indices], self.concat_dim)
         return self.postprocessor(this_cell, processed_inputs)

@@ -6,7 +6,7 @@ import math
 import torch
 import torch.nn as nn
 
-from nni.nas.nn.pytorch import ModelSpace
+from nni.nas import model_wrapper
 from .modules.nasbench101 import NasBench101Cell
 
 
@@ -61,10 +61,11 @@ class Conv1x1BNReLU(ConvBNReLU):
 Projection = Conv1x1BNReLU
 
 
-class NasBench101(ModelSpace):
+@model_wrapper
+class NasBench101(nn.Module):
     """The full search space proposed by `NAS-Bench-101 <http://proceedings.mlr.press/v97/ying19a/ying19a.pdf>`__.
 
-    It's simply a stack of :class:`~nni.nas.hub.pytorch.modules.NasBench101Cell`. Operations are conv3x3, conv1x1 and maxpool respectively.
+    It's simply a stack of :class:`~nni.retiarii.nn.pytorch.NasBench101Cell`. Operations are conv3x3, conv1x1 and maxpool respectively.
 
     Parameters
     ----------
@@ -73,7 +74,7 @@ class NasBench101(ModelSpace):
     num_stacks
         Number of stacks in the network.
     num_modules_per_stack
-        Number of modules in each stack. Each module is a :class:`~nni.nas.nn.pytorch.NasBench101Cell`.
+        Number of modules in each stack. Each module is a :class:`~nni.retiarii.nn.pytorch.NasBench101Cell`.
     max_num_vertices
         Maximum number of vertices in each cell.
     max_num_edges

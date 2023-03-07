@@ -1,16 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from __future__ import annotations
-
-from nni.common.serializer import SerializableObject
-from .evaluator import MutableEvaluator
+import nni
+from .evaluator import Evaluator
 
 
-class FunctionalEvaluator(MutableEvaluator):
+@nni.trace
+class FunctionalEvaluator(Evaluator):
     """
     Functional evaluator that directly takes a function and thus should be general.
-    See :class:`~nni.nas.evaluator.Evaluator` for instructions on how to write this function.
 
     Attributes
     ----------
@@ -24,30 +22,19 @@ class FunctionalEvaluator(MutableEvaluator):
         self.function = function
         self.arguments = kwargs
 
-    def extra_repr(self):
-        return f"{self.function!r}, arguments={self.arguments!r})"
+    @staticmethod
+    def _load(ir):
+        return FunctionalEvaluator(ir['function'], **ir['arguments'])
 
-    # NOTE: FunctionalEvaluator implements the traceable interface by itself,
-    #       so that it doesn't need the `nni.trace` decorator.
-    #       But I guess it works with the decorator as well.
-
-    @property
-    def trace_symbol(self):
-        return self.__class__
-
-    @property
-    def trace_args(self):
-        return []
-
-    @property
-    def trace_kwargs(self):
+    def _dump(self):
         return {
+            'type': self.__class__,
             'function': self.function,
-            **self.arguments
+            'arguments': self.arguments
         }
 
-    def trace_copy(self):
-        return SerializableObject(self.__class__, [], self.trace_kwargs)
+    def _execute(self, model_cls):
+        return self.function(model_cls, **self.arguments)
 
-    def evaluate(self, model):
-        return self.function(model, **self.arguments)
+    def __eq__(self, other):
+        return self.function == other.function and self.arguments == other.arguments

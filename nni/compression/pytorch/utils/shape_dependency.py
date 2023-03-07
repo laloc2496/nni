@@ -6,7 +6,7 @@ import logging
 import torch
 import numpy as np
 from nni.compression.pytorch.compressor import PrunerModuleWrapper
-from nni.compression.pytorch.base import PrunerModuleWrapper as PrunerModuleWrapper_v2
+from nni.algorithms.compression.v2.pytorch.base import PrunerModuleWrapper as PrunerModuleWrapper_v2
 from .utils import get_module_by_name
 
 
@@ -126,7 +126,7 @@ class ChannelDependency(Dependency):
         self.prune_type = prune_type
         self.target_types = []
         if self.prune_type == 'Filter':
-            self.target_types.extend(['Conv2d', 'Linear', 'ConvTranspose2d', 'Embedding'])
+            self.target_types.extend(['Conv2d', 'Linear', 'ConvTranspose2d'])
         elif self.prune_type == 'Batchnorm':
             self.target_types.append('BatchNorm2d')
 

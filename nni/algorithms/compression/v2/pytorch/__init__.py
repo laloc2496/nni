@@ -1,6 +1,4 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# pylint: disable=wildcard-import,unused-wildcard-import
-
-from nni.compression.pytorch import *
+from .utils import Evaluator, LightningEvaluator, TorchEvaluator, TransformersEvaluator

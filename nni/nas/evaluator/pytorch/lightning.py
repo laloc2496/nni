@@ -5,23 +5,31 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Union, Optional, List, Type
+from typing import Any, Dict, Union, Optional, List, Callable, Type
 
 import pytorch_lightning as pl
 import torch.nn as nn
 import torch.nn.functional as nn_functional
 import torch.optim as optim
 import torchmetrics
-import torchmetrics.classification
 import torch.utils.data as torch_data
 
 import nni
 from nni.common.serializer import is_traceable
-from nni.nas.evaluator import MutableEvaluator
+try:
+    from .cgo import trainer as cgo_trainer
+    cgo_import_failed = False
+except ImportError:
+    cgo_import_failed = True
+
+from nni.nas.evaluator import Evaluator
+from nni.typehint import Literal
+
 
 __all__ = [
     'LightningModule', 'Trainer', 'DataLoader', 'Lightning', 'Classification', 'Regression',
-    'SupervisedLearningModule', 'ClassificationModule', 'RegressionModule',
+    'SupervisedLearningModule', 'ClassificationModule', 'RegressionModule', 'AccuracyWithLogits',
+    # FIXME: hack to make it importable for tests
 ]
 
 _logger = logging.getLogger(__name__)
@@ -34,31 +42,25 @@ class LightningModule(pl.LightningModule):
 
     It's a subclass of ``pytorch_lightning.LightningModule``.
     See https://pytorch-lightning.readthedocs.io/en/stable/common/lightning_module.html
-
-    See :class:`SupervisedLearningModule` as an example.
     """
 
-    @property
-    def model(self) -> nn.Module:
-        """The inner model (architecture) to train / evaluate.
+    running_mode: Literal['multi', 'oneshot'] = 'multi'
+    """An indicator of whether current module is running in a multi-trial experiment or an one-shot.
+    This flag should be automatically set by experiments when they start to run.
+    """
 
-        It will be only available after calling :meth:`set_model`.
-        """
-        model = getattr(self, '_model', None)
-        if model is None:
-            raise RuntimeError('Model is not set. Please call set_model() first.')
-        return model
-
-    def set_model(self, model: nn.Module) -> None:
+    def set_model(self, model: Union[Callable[[], nn.Module], nn.Module]) -> None:
         """Set the inner model (architecture) to train / evaluate.
 
-        As there is no explicit method to "unset" a model,
-        the model is left in the lightning module after the method is called.
-        We don't recommend relying on this behavior.
+        Parameters
+        ----------
+        model : callable or nn.Module
+            Can be a callable returning nn.Module or nn.Module.
         """
-        if not isinstance(model, nn.Module):
-            raise TypeError('model must be an instance of nn.Module')
-        self._model = model
+        if isinstance(model, nn.Module):
+            self.model = model
+        else:
+            self.model = model()
 
 
 Trainer = nni.trace(pl.Trainer)
@@ -72,7 +74,7 @@ Traced version of ``torch.utils.data.DataLoader``. See https://pytorch.org/docs/
 
 
 @nni.trace
-class Lightning(MutableEvaluator):
+class Lightning(Evaluator):
     """
     Delegate the whole training to PyTorch Lightning.
 
@@ -105,16 +107,6 @@ class Lightning(MutableEvaluator):
         It can be `any types of dataloader supported by Lightning <https://pytorch-lightning.readthedocs.io/en/stable/guides/data.html>`__.
     fit_kwargs
         Keyword arguments passed to ``trainer.fit()``.
-
-    Examples
-    --------
-    Users should define a Lightning module that inherits :class:`LightningModule`,
-    and use :class:`Trainer` and :class:`DataLoader` from ```nni.nas.evaluator.pytorch``,
-    and make them parameters of this evaluator::
-
-        import nni
-        from nni.nas.evaluator.pytorch.lightning import Lightning, LightningModule, Trainer, DataLoader
-
     """
 
     def __init__(self, lightning_module: LightningModule, trainer: Trainer,
@@ -126,8 +118,12 @@ class Lightning(MutableEvaluator):
         if train_dataloader is not None:
             warnings.warn('`train_dataloader` is deprecated and replaced with `train_dataloaders`.', DeprecationWarning)
             train_dataloaders = train_dataloader
-        if not (isinstance(trainer, pl.Trainer) and is_traceable(trainer)):
-            raise TypeError(f'Trainer must be imported from {__name__}, but found {trainer.__class__.__qualname__}')
+        if cgo_import_failed:
+            assert isinstance(trainer, pl.Trainer) and is_traceable(trainer), f'Trainer must be imported from {__name__}'
+        else:
+            # this is not isinstance(trainer, Trainer) because with a different trace call, it can be different
+            assert (isinstance(trainer, pl.Trainer) and is_traceable(trainer)) or isinstance(trainer, cgo_trainer.Trainer), \
+                f'Trainer must be imported from {__name__} or nni.retiarii.evaluator.pytorch.cgo.trainer'
         if not _check_dataloader(train_dataloaders):
             warnings.warn(f'Please try to wrap PyTorch DataLoader with nni.trace or '
                           f'import DataLoader from {__name__}: {train_dataloaders}',
@@ -142,19 +138,53 @@ class Lightning(MutableEvaluator):
         self.val_dataloaders = val_dataloaders
         self.fit_kwargs = fit_kwargs or {}
 
-    def evaluate(self, model):
+    @staticmethod
+    def _load(ir):
+        return Lightning(ir['module'], ir['trainer'], ir['train_dataloaders'], ir['val_dataloaders'])
+
+    def _dump(self):
+        return {
+            'type': self.__class__,
+            'module': self.module,
+            'trainer': self.trainer,
+            'train_dataloaders': self.train_dataloaders,
+            'val_dataloaders': self.val_dataloaders
+        }
+
+    def _execute(self, model_cls):
+        return self.fit(model_cls)
+
+    @property
+    def train_dataloader(self):
+        warnings.warn('train_dataloader is deprecated, please use `train_dataloaders`.', DeprecationWarning)
+
+    def __eq__(self, other):
+        eq_func = False
+        eq_args = False
+        if other is None:
+            return False
+        if hasattr(self, "function") and hasattr(other, "function"):
+            eq_func = getattr(self, "function") == getattr(other, "function")
+        elif not (hasattr(self, "function") or hasattr(other, "function")):
+            eq_func = True
+
+        if hasattr(self, "arguments") and hasattr(other, "arguments"):
+            eq_args = getattr(self, "arguments") == getattr(other, "arguments")
+        elif not (hasattr(self, "arguments") or hasattr(other, "arguments")):
+            eq_args = True
+
+        return eq_func and eq_args
+
+    def fit(self, model):
         """
         Fit the model with provided dataloader, with Lightning trainer.
         If ``train_dataloaders`` is not provided, ``trainer.validate()`` will be called.
 
         Parameters
         ----------
-        model
+        model : nn.Module
             The model to fit.
         """
-        if self.is_mutable():
-            raise RuntimeError('Mutable evaluator must first be `freeze()` before evaluation.')
-
         self.module.set_model(model)
         if self.train_dataloaders is None:
             _logger.info('Train dataloaders are missing. Skip to validation.')
@@ -163,25 +193,6 @@ class Lightning(MutableEvaluator):
             if self.val_dataloaders is None:
                 _logger.warning('Validation dataloaders are missing.')
             return self.trainer.fit(self.module, self.train_dataloaders, self.val_dataloaders, **self.fit_kwargs)
-
-    @property
-    def train_dataloader(self):
-        warnings.warn('train_dataloader is deprecated, please use `train_dataloaders`.', DeprecationWarning)
-
-    def __eq__(self, other):
-        if not isinstance(other, Lightning):
-            return False
-        return self.module == other.module and self.trainer == other.trainer and \
-            self.train_dataloaders == other.train_dataloaders and self.val_dataloaders == other.val_dataloaders and \
-            self.fit_kwargs == other.fit_kwargs
-
-    def __repr__(self):
-        return f'{self.__class__.__name__}({self.module}, {self.trainer}, train_dataloaders={self.train_dataloaders}, ' \
-            f'val_dataloaders={self.val_dataloaders}, fit_kwargs={self.fit_kwargs})'
-
-    def fit(self, model):
-        warnings.warn('`fit` is deprecated, please use `evaluate`.', DeprecationWarning)
-        return self.evaluate(model)
 
 
 def _check_dataloader(dataloader):
@@ -201,7 +212,7 @@ class SupervisedLearningModule(LightningModule):
 
     trainer: pl.Trainer
 
-    def __init__(self, criterion: Type[nn.Module], metrics: Dict[str, torchmetrics.Metric],
+    def __init__(self, criterion: Type[nn.Module], metrics: Dict[str, Type[torchmetrics.Metric]],
                  learning_rate: float = 0.001,
                  weight_decay: float = 0.,
                  optimizer: Type[optim.Optimizer] = optim.Adam,
@@ -210,7 +221,7 @@ class SupervisedLearningModule(LightningModule):
         self.save_hyperparameters('criterion', 'optimizer', 'learning_rate', 'weight_decay')
         self.criterion = criterion()
         self.optimizer = optimizer
-        self.metrics = nn.ModuleDict(metrics)
+        self.metrics = nn.ModuleDict({name: cls() for name, cls in metrics.items()})
 
         if export_onnx is None or export_onnx is True:
             self.export_onnx = Path(os.environ.get('NNI_OUTPUT_DIR', '.')) / 'model.onnx'
@@ -236,7 +247,7 @@ class SupervisedLearningModule(LightningModule):
         x, y = batch
         y_hat = self(x)
 
-        if self.export_onnx is not None:
+        if self.running_mode == 'multi' and self.export_onnx is not None:
             self.export_onnx.parent.mkdir(exist_ok=True)
             try:
                 self.to_onnx(self.export_onnx, x, export_params=True)
@@ -259,43 +270,32 @@ class SupervisedLearningModule(LightningModule):
         return self.optimizer(self.parameters(), lr=self.hparams.learning_rate, weight_decay=self.hparams.weight_decay)  # type: ignore
 
     def on_validation_epoch_end(self):
-        if nni.get_current_parameter() is not None and not self.trainer.sanity_checking:
+        if not self.trainer.sanity_checking and self.running_mode == 'multi' and nni.get_current_parameter() is not None:
             # Don't report metric when sanity checking
-            nni.report_intermediate_result(self._get_result_for_report())
+            nni.report_intermediate_result(self._get_validation_metrics())
 
     def on_fit_end(self):
-        # Inline import to avoid errors with unsupported lightning version
-        from pytorch_lightning.trainer.states import TrainerFn
-        if self.trainer.state.fn == TrainerFn.FITTING:
-            self._final_report()
+        self._final_report()
 
     def on_validation_end(self):
-        from pytorch_lightning.trainer.states import TrainerFn
-        if self.trainer.state.fn == TrainerFn.VALIDATING:
-            self._final_report()
+        self._final_report()
 
     def _final_report(self):
-        if nni.get_current_parameter() is not None:
-            nni.report_final_result(self._get_result_for_report())
+        if self.running_mode == 'multi' and nni.get_current_parameter() is not None:
+            nni.report_final_result(self._get_validation_metrics())
 
-    def _get_result_for_report(self):
-        stage = 'val'
-        if not self.trainer.val_dataloaders:
-            _logger.debug('No validation dataloader. Use results on training set instead.')
-            stage = 'train'
-
+    def _get_validation_metrics(self):
         if len(self.metrics) == 1:
             metric_name = next(iter(self.metrics))
-            return self.trainer.callback_metrics[f'{stage}_{metric_name}'].item()
+            return self.trainer.callback_metrics['val_' + metric_name].item()
         else:
             warnings.warn('Multiple metrics without "default" is not supported by current framework.')
-            return {name: self.trainer.callback_metrics[f'{stage}_{name}'].item() for name in self.metrics}
+            return {name: self.trainer.callback_metrics['val_' + name].item() for name in self.metrics}
 
 
-class _AccuracyWithLogits(torchmetrics.Accuracy):
-    # Only for torchmetrics < 0.11
+class AccuracyWithLogits(torchmetrics.Accuracy):
     def update(self, pred, target):
-        return super().update(nn_functional.softmax(pred, dim=-1), target)  # type: ignore
+        return super().update(nn_functional.softmax(pred, dim=-1), target)
 
 
 @nni.trace
@@ -304,25 +304,12 @@ class ClassificationModule(SupervisedLearningModule):
                  learning_rate: float = 0.001,
                  weight_decay: float = 0.,
                  optimizer: Type[optim.Optimizer] = optim.Adam,
-                 export_onnx: bool = False,
-                 num_classes: Optional[int] = None):
-
-        from packaging.version import Version
-        if Version(torchmetrics.__version__) < Version('0.11.0'):
-            # Older version accepts num_classes = None
-            metrics = {'acc': _AccuracyWithLogits()}  # type: ignore # pylint: disable=no-value-for-parameter
-        else:
-            if num_classes is None:
-                raise ValueError('num_classes must be specified for torchmetrics >= 0.11. '
-                                 'Please either specify it or use an older version of torchmetrics.')
-            metrics = {'acc': torchmetrics.Accuracy('multiclass', num_classes=num_classes)}
-
-        super().__init__(criterion, metrics,  # type: ignore
+                 export_onnx: bool = True):
+        super().__init__(criterion, {'acc': AccuracyWithLogits},
                          learning_rate=learning_rate, weight_decay=weight_decay, optimizer=optimizer,
                          export_onnx=export_onnx)
 
 
-@nni.trace
 class Classification(Lightning):
     """
     Evaluator that is used for classification.
@@ -352,9 +339,6 @@ class Classification(Lightning):
         If the ``lightning_module`` has a predefined val_dataloaders method this will be skipped.
     export_onnx : bool
         If true, model will be exported to ``model.onnx`` before training starts. default true
-    num_classes : int
-        Number of classes for classification task.
-        Required for torchmetrics >= 0.11.0. default: None
     trainer_kwargs : dict
         Optional keyword arguments passed to trainer. See
         `Lightning documentation <https://pytorch-lightning.readthedocs.io/en/stable/common/trainer.html>`__ for details.
@@ -378,16 +362,14 @@ class Classification(Lightning):
                  optimizer: Type[optim.Optimizer] = optim.Adam,
                  train_dataloaders: Optional[DataLoader] = None,
                  val_dataloaders: Union[DataLoader, List[DataLoader], None] = None,
-                 export_onnx: bool = False,
+                 export_onnx: bool = True,
                  train_dataloader: Optional[DataLoader] = None,
-                 num_classes: Optional[int] = None,
                  **trainer_kwargs):
         if train_dataloader is not None:
             warnings.warn('`train_dataloader` is deprecated and replaced with `train_dataloaders`.', DeprecationWarning)
             train_dataloaders = train_dataloader
         module = ClassificationModule(criterion=criterion, learning_rate=learning_rate,
-                                      weight_decay=weight_decay, optimizer=optimizer, export_onnx=export_onnx,
-                                      num_classes=num_classes)
+                                      weight_decay=weight_decay, optimizer=optimizer, export_onnx=export_onnx)
         super().__init__(module, Trainer(**trainer_kwargs),
                          train_dataloaders=train_dataloaders, val_dataloaders=val_dataloaders)
 
@@ -398,13 +380,12 @@ class RegressionModule(SupervisedLearningModule):
                  learning_rate: float = 0.001,
                  weight_decay: float = 0.,
                  optimizer: Type[optim.Optimizer] = optim.Adam,
-                 export_onnx: bool = False):
-        super().__init__(criterion, {'mse': torchmetrics.MeanSquaredError()},
+                 export_onnx: bool = True):
+        super().__init__(criterion, {'mse': torchmetrics.MeanSquaredError},
                          learning_rate=learning_rate, weight_decay=weight_decay, optimizer=optimizer,
                          export_onnx=export_onnx)
 
 
-@nni.trace
 class Regression(Lightning):
     """
     Evaluator that is used for regression.
@@ -453,7 +434,7 @@ class Regression(Lightning):
                  optimizer: Type[optim.Optimizer] = optim.Adam,
                  train_dataloaders: Optional[DataLoader] = None,
                  val_dataloaders: Union[DataLoader, List[DataLoader], None] = None,
-                 export_onnx: bool = False,
+                 export_onnx: bool = True,
                  train_dataloader: Optional[DataLoader] = None,
                  **trainer_kwargs):
         if train_dataloader is not None:
@@ -467,5 +448,6 @@ class Regression(Lightning):
 
 # Alias for backwards compatibility
 _SupervisedLearningModule = SupervisedLearningModule
+_AccuracyWithLogits = AccuracyWithLogits
 _ClassificationModule = ClassificationModule
 _RegressionModule = RegressionModule

@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 import json
-from typing import List, Optional
+from typing import List
 
 
 @dataclass
@@ -82,17 +82,11 @@ class TrialHyperParameters:
         Hyper parameters.
     parameter_index: int
         Parameter index.
-    placement_constraint: Optional[dict]
-        Placement constraint.
-    version_info: Optional[dict]
-        Version info.
     """
     parameter_id: int
     parameter_source: str
     parameters: dict
     parameter_index: int
-    placement_constraint: Optional[dict] = None
-    version_info: Optional[dict] = None
 
 
 @dataclass

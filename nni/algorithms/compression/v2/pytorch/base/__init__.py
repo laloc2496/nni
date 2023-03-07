@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# pylint: disable=wildcard-import,unused-wildcard-import
-
-from nni.compression.pytorch.base import *
+from .compressor import Compressor, LayerInfo
+from .pruner import Pruner, PrunerModuleWrapper
+from .scheduler import BasePruningScheduler, Task, TaskResult

@@ -1,4 +1,5 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from nni.compression.pytorch.pruning.tools.rl_env import *
+from .agent import DDPG
+from .amc_env import AMCEnv
